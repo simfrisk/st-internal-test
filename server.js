@@ -4,7 +4,10 @@
 //   ST_INTERNAL_PORTS  comma-separated ports to try (first that answers /hello wins)
 //   ST_INTERNAL_URL    optional explicit base, e.g. http://host:3567 (skips port scan)
 //   ST_PUBLIC_URL      public ingress URL, used for the no-token comparison
+//   ST_API_KEY         API key of the core, sent as the api-key header. Never shown or logged.
 const http = require("http");
+
+const API_KEY = process.env.ST_API_KEY || "";
 
 const INTERNAL_HOST =
   process.env.ST_INTERNAL_HOST ||
@@ -24,8 +27,8 @@ async function probe(url, opts) {
   const timer = setTimeout(() => ctl.abort(), 5000);
   try {
     const r = await fetch(url, Object.assign({ signal: ctl.signal }, opts || {}));
-    const body = (await r.text()).slice(0, 300);
-    return { url, status: r.status, body };
+    const full = await r.text();
+    return { url, status: r.status, body: full.slice(0, 300), full: full };
   } catch (e) {
     const cause = e && e.cause ? e.cause.code || e.cause.message || String(e.cause) : e.message;
     return { url, error: String(cause) };
@@ -58,39 +61,71 @@ function send(res, code, type, body) {
   res.end(body);
 }
 
+function headers(key) {
+  const h = { "Content-Type": "application/json", "cdi-version": CDI };
+  if (key) h["api-key"] = key;
+  return h;
+}
+
+function show(r) {
+  // Display form: status and a short body only, never request headers.
+  if (typeof r.status !== "number") return { error: r.error };
+  return { status: r.status, body: r.body };
+}
+
+async function coreSignin(base, key, email, password) {
+  return probe(base + "/recipe/signin", {
+    method: "POST",
+    headers: headers(key),
+    body: JSON.stringify({ email: email, password: password }),
+  });
+}
+
 async function diag() {
-  const out = { internalHost: INTERNAL_HOST, portsTried: PORTS, internal: {}, publicNoToken: {} };
+  const out = {
+    internalHost: INTERNAL_HOST,
+    portsTried: PORTS,
+    apiKeyConfigured: API_KEY.length > 0,
+    internal: {},
+    publicNoTokenNoKey: {},
+  };
   const base = await findBase();
   out.internalBaseUsed = base;
   if (base) {
-    out.internal.hello = await probe(base + "/hello");
-    out.internal.apiversion = await probe(base + "/apiversion");
+    const wrong = "wrong-" + Math.random().toString(36).slice(2);
+    out.internal.a_noKey_usersCount = show(await probe(base + "/users/count", { headers: headers("") }));
+    out.internal.a_noKey_signin = show(await coreSignin(base, "", "test1@example.com", "not-the-password"));
+    out.internal.b_wrongKey_usersCount = show(await probe(base + "/users/count", { headers: headers(wrong) }));
+    out.internal.b_wrongKey_signin = show(await coreSignin(base, wrong, "test1@example.com", "not-the-password"));
+    out.internal.c_correctKey_usersCount = API_KEY
+      ? show(await probe(base + "/users/count", { headers: headers(API_KEY) }))
+      : { skipped: "ST_API_KEY not set" };
+    out.internal.d_correctKey_wrongPassword_signin = API_KEY
+      ? show(await coreSignin(base, API_KEY, "test1@example.com", "not-the-password"))
+      : { skipped: "ST_API_KEY not set" };
+    out.internal.noKey_hello = show(await probe(base + "/hello"));
   } else {
     out.internal.error = "no internal port answered";
     for (const p of PORTS) {
       const b = "http://" + INTERNAL_HOST + ":" + p;
-      out.internal["port_" + p] = await probe(b + "/hello");
+      out.internal["port_" + p] = show(await probe(b + "/hello"));
     }
   }
-  out.publicNoToken.hello = await probe(PUBLIC_URL + "/hello");
-  out.publicNoToken.apiversion = await probe(PUBLIC_URL + "/apiversion");
+  out.publicNoTokenNoKey.hello = show(await probe(PUBLIC_URL + "/hello", { redirect: "manual" }));
+  out.publicNoTokenNoKey.usersCount = show(await probe(PUBLIC_URL + "/users/count", { redirect: "manual" }));
   return out;
 }
 
 async function signin(email, password) {
   const base = await findBase();
   if (!base) return { ok: false, coreStatus: null, result: "NO INTERNAL CORE REACHABLE" };
-  const r = await probe(base + "/recipe/signin", {
-    method: "POST",
-    headers: { "Content-Type": "application/json", "cdi-version": CDI },
-    body: JSON.stringify({ email: email, password: password }),
-  });
+  const r = await coreSignin(base, API_KEY, email, password);
   if (typeof r.status !== "number") {
     return { ok: false, coreStatus: null, result: "REQUEST FAILED: " + (r.error || "unknown") };
   }
   let status = null;
   try {
-    status = JSON.parse(r.body).status;
+    status = JSON.parse(r.full).status;
   } catch (e) {
     status = null;
   }
@@ -99,6 +134,8 @@ async function signin(email, password) {
       ? "SIGN-IN OK"
       : status === "WRONG_CREDENTIALS_ERROR"
       ? "WRONG_CREDENTIALS"
+      : r.status === 401
+      ? "REFUSED BY CORE (401): " + r.body.slice(0, 120)
       : "OTHER: " + (status || r.body.slice(0, 120));
   return { ok: true, coreStatus: r.status, result: result };
 }
@@ -110,7 +147,7 @@ function formPage(msg) {
     "input{padding:.4rem;width:16rem}button{padding:.5rem 1rem;margin-top:.5rem}" +
     "code{background:#f0f0f0;padding:.1rem .3rem}.m{margin:1rem 0;padding:.6rem;background:#eef;border-radius:4px}</style>" +
     "</head><body><h1>SuperTokens internal-address test</h1>" +
-    "<p>This app calls the SuperTokens core over the cluster-internal address with no OSC token. " +
+    "<p>This app calls the SuperTokens core over the cluster-internal address with no OSC token, sending the core API key from its config. " +
     "See <a href=/diag>/diag</a> for the raw probe.</p>" +
     (msg ? '<div class="m">' + msg + "</div>" : "") +
     '<form method="POST" action="/signin">' +
